@@ -1,6 +1,6 @@
 idf_component_register(
-    SRCS "main.c"
-         "mpu6050.c"
-         "sismo_math.S"
+    SRCS "nivel_terremoto.S" "main.c"
+         "mpu6500.c"
+        
     INCLUDE_DIRS "."
 )

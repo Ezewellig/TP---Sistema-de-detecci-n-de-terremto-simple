@@ -4,8 +4,10 @@
   "idf.openOcdConfigs": [
     "board/esp32c3-builtin.cfg"
   ],
-  "idf.currentSetup": "C:\\esp\\v5.5.4\\esp-idf",
+  "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.2.2/",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c3"
-  }
+  },
+  "idf.flashType": "UART",
+  "idf.portWin": "COM3"
 }
