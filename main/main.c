@@ -1,191 +1,433 @@
+/* =====================================================================
+ *  SISTEMA DE DETECCION DE TERREMOTO POR UMBRAL
+ *  ESP32-C3 SuperMini
+ *
+ *  Implementa la consigna del Proyecto 26:
+ *
+ *   - Arranca en estado de VIGILANCIA y lo informa por terminal, con el
+ *     contador de eventos en cero.
+ *   - Espera interrupciones externas. El bucle principal NO hace polling:
+ *     la tarea queda bloqueada hasta que la ISR la despierta.
+ *   - Cuenta "golpes" dentro de una VENTANA DESLIZANTE de 10 segundos.
+ *   - Clasifica en BAJO / MEDIO / ALTO segun CUANTOS golpes hay en esa
+ *     ventana, e informa el nivel APENAS lo alcanza, sin esperar a que
+ *     la ventana termine.
+ *   - Si siguen llegando golpes y la frecuencia sube, el nivel ESCALA
+ *     (bajo -> medio -> alto).
+ *   - Cuando pasan 10 s sin ningun golpe nuevo, cierra el episodio e
+ *     informa duracion total, golpes totales y nivel maximo alcanzado.
+ *     Despues vuelve a vigilancia con el contador en cero.
+ *
+ *  Funciona con DOS sensores distintos, elegidos con USAR_HW139:
+ *
+ *    USAR_HW139 = 1 -> HW-139 (interruptor de vibracion, salida digital).
+ *                      Cada pulso del sensor es un golpe. No usa I2C.
+ *    USAR_HW139 = 0 -> MPU-6050 / MPU-9250 por I2C. La interrupcion
+ *                      "dato listo" llega a 100 Hz y se considera golpe
+ *                      cada vez que la aceleracion supera un umbral.
+ *                      Ademas mide la intensidad real en mili-g.
+ * ===================================================================*/
 #include <stdio.h>
 #include <stdbool.h>
-#include <stdint.h>
+#include <inttypes.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "driver/gpio.h"
+#include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_attr.h"
-#include "esp_err.h"
-#define SENSOR_PIN 4
-#define LED_VERDE 5
-#define LED_AMARILLO 6
-#define LED_ROJO 7
-//definimos el maximo de eventos que podemos almacenar en el buffer de golpes
-#define MAX_EVENTOS 100
-//ventana de tiempo de 10 segundos para contar los golpes
-#define VENTANA_MS 10000
 
+#include "sismo_math.h"
 
-//Variables volatiles porque se modifican dentro de la interrupcion.
-volatile uint64_t golpes[MAX_EVENTOS];
-volatile int cantidad_golpes = 0;
-volatile int golpesTotalesEvento = 0;
+/* =====================================================================
+ *  ELECCION DEL SENSOR
+ * ===================================================================*/
+#define USAR_HW139          0       /* 1 = HW-139 ; 0 = MPU por I2C */
 
-//iniciamos el evento en falso y ponemos todo en 0
-volatile bool eventoActivo = false; //preguntar si poner 1 verdaero y 0 falso o con bool
-volatile uint64_t inicioEvento = 0;
-volatile int nivelMaximo = 0;
+#if !USAR_HW139
+#include "mpu6050.h"
+#endif
 
-//declaracion de la funcion en Assembler RISC-V
-extern int calcular_nivel_sismo(int golpes);
-//declaracion de la funcion para actualizar los leds
-void actualizar_leds(int nivel);
-void reportar_nivel(int nivel);
-void actualizarVentana();
-//interrupcion ISR
-//IRAM_ATTR guarda esta funcion en la memoria RAM para que sea mas rapida y no se quede sin memoria
-// y no en la memoria flash que es mas lenta y puede quedarse sin memoria
-void IRAM_ATTR ISR_sensor(void* arg){ 
-    static uint64_t ultima_ISR = 0;
-    uint64_t tiempo_Ahora = esp_timer_get_time()/1000; //obtenemos el tiempo en milisegundos
+/* =====================================================================
+ *  PARAMETROS AJUSTABLES
+ * ===================================================================*/
+#define PIN_SENSOR          4       /* HW-139 DO, o INT del MPU */
 
-    //si el tiempo transcurrido desde la ultima interrupcion es menor a 50ms,
-    // entonces no hacemos nada para evitar saturar el buffer de golpes
-    if(tiempo_Ahora-ultima_ISR<50)
+/* --- ventana deslizante --- */
+#define VENTANA_MS          10000                   /* 10 segundos      */
+#define VENTANA_US          (VENTANA_MS * 1000LL)
+#define MAX_GOLPES          64      /* capacidad del buffer circular    */
+
+/* --- que cuenta como un golpe --- */
+#define REFRACTARIO_MS      120     /* antirrebote: despues de un golpe,
+                                       ignoramos el sensor este tiempo.
+                                       Sin esto, una sola sacudida se
+                                       contaria como veinte golpes.     */
+#if !USAR_HW139
+#define UMBRAL_GOLPE_MG     40      /* aceleracion minima para contar   */
+#define MUESTRAS_CALIB      200     /* 2 s aprendiendo la gravedad      */
+#define K_BASE              6       /* filtro pasaaltos: tau = 0.64 s   */
+#endif
+
+/* --- clasificacion por CANTIDAD de golpes en la ventana --- */
+#define N_PARA_MEDIO        4       /*  4..9 golpes  -> MEDIO */
+#define N_PARA_ALTO         10      /* >=10 golpes   -> ALTO  */
+                                    /*  1..3 golpes  -> BAJO  */
+
+/* ---- LEDs: preparado para el futuro, apagado por ahora ---- */
+#define USAR_LEDS           0
+#define PIN_LED_VERDE       0
+#define PIN_LED_AMARILLO    1
+#define PIN_LED_ROJO        3
+
+static const char *TAG = "sismo";
+
+/* =====================================================================
+ *  TIPOS Y ESTADO
+ * ===================================================================*/
+typedef enum {
+    NIVEL_NINGUNO = 0,
+    NIVEL_BAJO,
+    NIVEL_MEDIO,
+    NIVEL_ALTO
+} nivel_t;
+
+static const char *NOMBRE_NIVEL[] = { "-", "BAJO", "MEDIO", "ALTO" };
+
+static TaskHandle_t s_tarea;
+
+/* --- ventana deslizante: cola FIFO circular de marcas de tiempo --- */
+static int64_t  s_cola[MAX_GOLPES];
+static int      s_ini  = 0;     /* indice del golpe mas viejo */
+static int      s_cant = 0;     /* cuantos hay guardados      */
+
+/* --- episodio sismico en curso --- */
+static bool     s_evento_activo   = false;
+static int64_t  s_t_primer_golpe  = 0;
+static int64_t  s_t_ultimo_golpe  = 0;
+static uint32_t s_golpes_totales  = 0;
+static nivel_t  s_nivel_actual    = NIVEL_NINGUNO;
+static nivel_t  s_nivel_maximo    = NIVEL_NINGUNO;
+static int64_t  s_t_ultimo_contado = 0;   /* para el refractario */
+#if !USAR_HW139
+static uint32_t s_pico_lsb        = 0;    /* dato extra de intensidad */
+#endif
+
+/* =====================================================================
+ *  VENTANA DESLIZANTE
+ *
+ *  Guardamos la marca de tiempo de cada golpe en una cola circular.
+ *  "Deslizante" significa que en todo momento la ventana son los
+ *  ultimos 10 segundos contados hacia atras desde AHORA: por eso antes
+ *  de contar, tiramos a la basura los golpes que ya quedaron viejos.
+ * ===================================================================*/
+static void ventana_reset(void)
+{
+    s_ini = 0;
+    s_cant = 0;
+}
+
+static void ventana_agregar(int64_t t)
+{
+    if (s_cant == MAX_GOLPES) {          /* lleno: pisamos el mas viejo */
+        s_ini = (s_ini + 1) % MAX_GOLPES;
+        s_cant--;
+    }
+    s_cola[(s_ini + s_cant) % MAX_GOLPES] = t;
+    s_cant++;
+}
+
+/* Descarta lo que quedo fuera de la ventana y devuelve cuantos quedan. */
+static int ventana_contar(int64_t ahora)
+{
+    while (s_cant > 0 && (ahora - s_cola[s_ini]) > VENTANA_US) {
+        s_ini = (s_ini + 1) % MAX_GOLPES;
+        s_cant--;
+    }
+    return s_cant;
+}
+
+/* =====================================================================
+ *  CLASIFICACION: depende de CUANTOS golpes hay en la ventana
+ * ===================================================================*/
+static nivel_t clasificar(int golpes_en_ventana)
+{
+    if (golpes_en_ventana >= N_PARA_ALTO)  return NIVEL_ALTO;
+    if (golpes_en_ventana >= N_PARA_MEDIO) return NIVEL_MEDIO;
+    if (golpes_en_ventana >= 1)            return NIVEL_BAJO;
+    return NIVEL_NINGUNO;
+}
+
+/* =====================================================================
+ *  INTERRUPCION
+ *
+ *  Lo unico que hace es despertar a la tarea. Nada de I2C, printf ni
+ *  delays acá adentro.
+ * ===================================================================*/
+static void IRAM_ATTR isr_sensor(void *arg)
+{
+    BaseType_t hay_tarea_mas_prioritaria = pdFALSE;
+    vTaskNotifyGiveFromISR(s_tarea, &hay_tarea_mas_prioritaria);
+    portYIELD_FROM_ISR(hay_tarea_mas_prioritaria);
+}
+
+/* =====================================================================
+ *  INDICADORES (consola hoy, LEDs manana)
+ * ===================================================================*/
+static void indicar_nivel(nivel_t n)
+{
+#if USAR_LEDS
+    gpio_set_level(PIN_LED_VERDE,    n == NIVEL_BAJO);
+    gpio_set_level(PIN_LED_AMARILLO, n == NIVEL_MEDIO);
+    gpio_set_level(PIN_LED_ROJO,     n == NIVEL_ALTO);
+#else
+    (void)n;
+#endif
+}
+
+static void init_leds(void)
+{
+#if USAR_LEDS
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << PIN_LED_VERDE) |
+                        (1ULL << PIN_LED_AMARILLO) |
+                        (1ULL << PIN_LED_ROJO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    indicar_nivel(NIVEL_NINGUNO);
+#endif
+}
+
+/* =====================================================================
+ *  REGISTRAR UN GOLPE
+ *
+ *  Se llama cada vez que el sensor dice "hubo vibracion". Actualiza la
+ *  ventana, decide el nivel y lo informa SOLO si subio (escalado).
+ * ===================================================================*/
+static void registrar_golpe(int64_t ahora, uint32_t intensidad_mg)
+{
+    /* --- antirrebote: una sacudida = un golpe --- */
+    if (s_t_ultimo_contado != 0 &&
+        (ahora - s_t_ultimo_contado) < (REFRACTARIO_MS * 1000LL)) {
         return;
+    }
+    s_t_ultimo_contado = ahora;
 
-    //guardamos el tiempo de la ultima interrupcion para no saturar el buffer de golpes
-    ultima_ISR=tiempo_Ahora;
-    if(cantidad_golpes<MAX_EVENTOS)
-    {
-        golpes[cantidad_golpes]=tiempo_Ahora;
-        cantidad_golpes++; //sumamos un golpe al buffer de golpes
-        golpesTotalesEvento++; //sumo el total de golpes del evento para reportarlo al final del mismo
+    /* --- primer golpe: arranca el episodio --- */
+    if (!s_evento_activo) {
+        s_evento_activo  = true;
+        s_t_primer_golpe = ahora;
+        s_golpes_totales = 0;
+        s_nivel_actual   = NIVEL_NINGUNO;
+        s_nivel_maximo   = NIVEL_NINGUNO;
+#if !USAR_HW139
+        s_pico_lsb = 0;
+#endif
+        ventana_reset();
+        printf("\n--- INICIO DE EVENTO SISMICO ---\n");
+    }
+
+    s_golpes_totales++;
+    s_t_ultimo_golpe = ahora;
+
+    ventana_agregar(ahora);
+    int n = ventana_contar(ahora);
+
+    nivel_t nivel = clasificar(n);
+
+    /* --- reporte inmediato, solo cuando el nivel ESCALA --- */
+    if (nivel > s_nivel_actual) {
+        s_nivel_actual = nivel;
+        if (nivel > s_nivel_maximo) {
+            s_nivel_maximo = nivel;
+        }
+        indicar_nivel(nivel);
+        printf("  >> NIVEL %s  (%d golpes en los ultimos %d s)\n",
+               NOMBRE_NIVEL[nivel], n, VENTANA_MS / 1000);
+    } else {
+        printf("     golpe #%" PRIu32 "  (%d en ventana)",
+               s_golpes_totales, n);
+#if !USAR_HW139
+        printf("  [%" PRIu32 " mg]", intensidad_mg);
+#endif
+        printf("\n");
+    }
+
+    (void)intensidad_mg;
+}
+
+/* =====================================================================
+ *  CIERRE DEL EPISODIO
+ *
+ *  Si pasaron 10 s desde el ultimo golpe sin novedades, el episodio
+ *  termino: informamos el resumen y volvemos a vigilancia.
+ * ===================================================================*/
+static void verificar_cierre(int64_t ahora)
+{
+    if (!s_evento_activo) {
+        return;
+    }
+    if ((ahora - s_t_ultimo_golpe) <= VENTANA_US) {
+        return;
+    }
+
+    int64_t duracion_ms = (s_t_ultimo_golpe - s_t_primer_golpe) / 1000;
+
+    printf("\n=========================================\n");
+    printf("      CIERRE DEL EVENTO SISMICO\n");
+    printf("=========================================\n");
+    printf(" Duracion total   : %" PRId64 " ms  (%.1f s)\n",
+           duracion_ms, duracion_ms / 1000.0);
+    printf(" Golpes totales   : %" PRIu32 "\n", s_golpes_totales);
+    printf(" Nivel maximo     : %s\n", NOMBRE_NIVEL[s_nivel_maximo]);
+#if !USAR_HW139
+    printf(" Pico medido      : %" PRIu32 " mg\n",
+           (s_pico_lsb * 125u) >> 11);
+#endif
+    printf("=========================================\n");
+
+    /* --- vuelta a vigilancia, contador en cero --- */
+    s_evento_activo    = false;
+    s_golpes_totales   = 0;
+    s_nivel_actual     = NIVEL_NINGUNO;
+    s_nivel_maximo     = NIVEL_NINGUNO;
+    s_t_ultimo_contado = 0;
+    ventana_reset();
+    indicar_nivel(NIVEL_NINGUNO);
+
+    printf("Sensor activo. En vigilancia. Contador de eventos: 0\n\n");
+}
+
+/* =====================================================================
+ *  TAREA PRINCIPAL
+ * ===================================================================*/
+static void tarea_sismo(void *arg)
+{
+#if !USAR_HW139
+    accel_raw_t m;
+    int32_t base_x = 0, base_y = 0, base_z = 0;
+    bool    primera = true;
+    uint32_t calib  = 0;
+
+    ESP_LOGI(TAG, "Calibrando... mantene el sensor quieto.");
+#endif
+
+    for (;;) {
+        /* Bloqueados hasta que la ISR avise. El timeout de 100 ms NO es
+         * polling del sensor: solo sirve para poder cerrar el episodio
+         * cuando dejan de llegar golpes.                              */
+        uint32_t avisos = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+        int64_t  ahora  = esp_timer_get_time();
+
+        if (avisos > 0) {
+#if USAR_HW139
+            /* --- HW-139: cada interrupcion YA es un golpe --- */
+            registrar_golpe(ahora, 0);
+#else
+            /* --- MPU: leemos y decidimos si supera el umbral --- */
+            if (mpu_read_accel(&m) == ESP_OK) {
+
+                if (primera) {
+                    base_x = (int32_t)m.ax << K_BASE;
+                    base_y = (int32_t)m.ay << K_BASE;
+                    base_z = (int32_t)m.az << K_BASE;
+                    primera = false;
+                }
+
+                /* filtro pasaaltos: le sacamos la gravedad */
+                base_x += (((int32_t)m.ax << K_BASE) - base_x) >> K_BASE;
+                base_y += (((int32_t)m.ay << K_BASE) - base_y) >> K_BASE;
+                base_z += (((int32_t)m.az << K_BASE) - base_z) >> K_BASE;
+
+                int32_t hx = (int32_t)m.ax - (base_x >> K_BASE);
+                int32_t hy = (int32_t)m.ay - (base_y >> K_BASE);
+                int32_t hz = (int32_t)m.az - (base_z >> K_BASE);
+
+                /* modulo del vector, en ASSEMBLER */
+                uint32_t mag2 = asm_mag2(hx, hy, hz);
+                uint32_t mag  = asm_isqrt(mag2);
+                uint32_t mg   = (mag * 125u) >> 11;
+
+                if (calib < MUESTRAS_CALIB) {
+                    calib++;
+                    if (calib == MUESTRAS_CALIB) {
+                        printf("\nSensor activo. En vigilancia. "
+                               "Contador de eventos: 0\n");
+                        printf("Umbral de golpe: %d mg | ventana: %d s | "
+                               "medio >= %d golpes | alto >= %d golpes\n\n",
+                               UMBRAL_GOLPE_MG, VENTANA_MS / 1000,
+                               N_PARA_MEDIO, N_PARA_ALTO);
+                    }
+                } else if (mg >= UMBRAL_GOLPE_MG) {
+                    s_pico_lsb = asm_max_u32(s_pico_lsb, mag);  /* ASSEMBLER */
+                    registrar_golpe(ahora, mg);
+                }
+            }
+#endif
+        }
+
+        /* Con golpe o sin golpe, siempre miramos si hay que cerrar. */
+        verificar_cierre(ahora);
     }
 }
-///en ESP-IDF no hay setup() ni loop() como en Arduino, 
-//pero podemos usar estas funciones para organizar 
-//nuestro codigo y luego llamarlas desde app_main()
 
+/* =====================================================================
+ *  app_main
+ * ===================================================================*/
 void app_main(void)
 {
-    //configuracion de los pines de los leds como salida
-    gpio_set_direction(LED_VERDE, GPIO_MODE_OUTPUT);
-    gpio_set_direction(LED_AMARILLO, GPIO_MODE_OUTPUT);
-    gpio_set_direction(LED_ROJO, GPIO_MODE_OUTPUT);
-    //configuracion del pin del sensor como entrada
-    gpio_set_direction(SENSOR_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(SENSOR_PIN, GPIO_PULLUP_ONLY);
-    //configurar interrupcion para flanco descendente (FALLING) en el pin del sensor
-    gpio_set_intr_type(SENSOR_PIN, GPIO_INTR_NEGEDGE);
-    //instalar el servicio de interrupciones y registrar la ISR para el pin del sensor
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(SENSOR_PIN, ISR_sensor, NULL);
-    printf("\nSistema de vigilancia activo\n");
-    printf("\nEsperando vibraciones...\n");
-    actualizar_leds(0);
+    printf("\n=========================================\n");
+    printf(" SISTEMA DE DETECCION DE TERREMOTO\n");
+    printf(" ESP32-C3 + %s\n", USAR_HW139 ? "HW-139" : "MPU-6050/9250");
+    printf("=========================================\n");
 
-    
-    //el equivalente al loop() de Arduino es un while(1) en ESP-IDF, que se ejecuta indefinidamente
-    while(1)
-    {
-        actualizarVentana();
-        if(cantidad_golpes>0)
-        { 
-            //si hay golpes dentro de la ventana de tiempo, entonces hay un evento activo
-            if(!eventoActivo)
-            { 
-                //si no hay un evento activo, entonces iniciamos uno
-                eventoActivo=true;
-                inicioEvento=golpes[0];
+    init_leds();
 
-                printf("\nEVENTO DETECTADO\n");
-
-            }
-            //llamamos la funcon en Assembler para calcular el nivel del sismo
-            int nivel=calcular_nivel_sismo(cantidad_golpes);
-            //si el nivel calculado es mayor al nivel maximo registrado, entonces actualizamos el nivel maximo y reportamos el nivel
-            if(nivel>nivelMaximo)
-            {
-                //actualizamos el nivel maximo registrado
-                nivelMaximo=nivel;
-                //Reportamos el nivel del sismo
-                reportar_nivel(nivel);
-                //actualizamos los leds para mostrar el nivel del sismo
-                actualizar_leds(nivel);}
-         }
-        else
-        {
-            //si no hay golpes dentro de la ventana de tiempo, entonces el evento ha terminado
-            if(eventoActivo)
-            {
-                //si hay un evento activo, entonces lo finalizamos
-                eventoActivo=false;
-                //reportamos el fin del evento y la duracion del mismo
-                printf("\nFIN DEL EVENTO\n");
-                printf("\nDuracion(ms): %llu\n",(esp_timer_get_time()/1000)-inicioEvento);
-                printf("\nCantidad de golpes totales: %d\n",golpesTotalesEvento); 
-                printf("\nNivel maximo: ");
-                reportar_nivel(nivelMaximo);
-                //actualizamos el nivel maximo a 0 para el siguiente evento
-                nivelMaximo=0;
-                golpesTotalesEvento=0;
-                //actualizamos los leds para mostrar que no hay evento activo
-                actualizar_leds(0);
-
-                printf("\nSistema nuevamente en vigilancia.\n");
-
-            }
-
-        }
-        vTaskDelay(100 / portTICK_PERIOD_MS); //delay de 100ms para no saturar el procesador
+#if !USAR_HW139
+    /* --- sensor I2C primero, con su INT todavia apagada --- */
+    if (mpu_init() != ESP_OK) {
+        ESP_LOGE(TAG, "No se pudo inicializar el sensor. Revisa el cableado.");
+        return;
     }
+#endif
+
+    /* --- la tarea que procesa los golpes --- */
+    xTaskCreate(tarea_sismo, "sismo", 4096, NULL, 10, &s_tarea);
+
+    /* --- el pin de interrupcion --- */
+    gpio_config_t cfg_int = {
+        .pin_bit_mask = (1ULL << PIN_SENSOR),
+        .mode         = GPIO_MODE_INPUT,
+#if USAR_HW139
+        /* El HW-139 con LM393 tiene la salida en alto en reposo y la
+         * baja al vibrar. Si tu modulo hace lo contrario, cambia a
+         * GPIO_INTR_POSEDGE y pull-down.                              */
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_NEGEDGE,
+#else
+        /* El MPU pulsa el INT en alto durante 50 us. */
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type    = GPIO_INTR_POSEDGE,
+#endif
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg_int));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_SENSOR, isr_sensor, NULL));
+
+#if !USAR_HW139
+    /* --- recien ahora habilitamos la INT del sensor --- */
+    ESP_ERROR_CHECK(mpu_habilitar_int_dato_listo(true));
+#else
+    printf("\nSensor activo. En vigilancia. Contador de eventos: 0\n");
+    printf("Ventana: %d s | medio >= %d golpes | alto >= %d golpes\n\n",
+           VENTANA_MS / 1000, N_PARA_MEDIO, N_PARA_ALTO);
+#endif
+
+    ESP_LOGI(TAG, "Interrupciones activas en GPIO%d", PIN_SENSOR);
 }
-
-
-
-//actualizamos ventana de tiempo para contar los golpes y eliminar los que ya no estan dentro de la ventana
-void actualizarVentana()
-{
-    uint64_t tiempo_Ahora = esp_timer_get_time()/1000;
-    int i=0;
-
-    while(i<cantidad_golpes)
-    {
-       if(tiempo_Ahora-golpes[i]<=VENTANA_MS)
-            break;
-
-        i++;
-    }
-
-    if(i>0)
-    {
-        //elimino los golpes que ya no estan dentro de la ventana de tiempo
-        for(int j=0; j<cantidad_golpes - i; j++)
-            golpes[j]=golpes[j+i];
-        cantidad_golpes-=i;
-    }
-
-}
-
-void reportar_nivel(int nivel)
-{
-    //reportamos el nivel del sismo por el puerto 
-    printf("\nNivel: ");
-    //usamos un switch para reportar el nivel del sismo
-    switch(nivel)
-    {
-        case 1:
-            printf("BAJO\n");
-            break;
-        case 2:
-            printf("MEDIO\n");
-            break;
-        case 3:
-            printf("ALTO\n");
-            break;
-    }
-}
-
-
-void actualizar_leds(int nivel)
-{
-    //actualizamos los leds para mostrar el nivel del sismo
-    //gpio_set_level recibe el pin y un estado (0 o 1) para encender o apagar el led
-    gpio_set_level(LED_VERDE, (nivel==0||nivel==1) ? 1 : 0);
-    gpio_set_level(LED_AMARILLO, (nivel==2) ? 1 : 0);
-    gpio_set_level(LED_ROJO, (nivel==3) ? 1 : 0);
-}
-
