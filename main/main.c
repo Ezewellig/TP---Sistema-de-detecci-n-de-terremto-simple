@@ -25,12 +25,6 @@
 #define N_PARA_ALTO 25 // >=25 golpes -> ALTO
 // 1 a 9 golpes  -> BAJO
 
-//LEDs: preparado para el futuro, apagado por ahora
-#define USAR_LEDS           0
-#define PIN_LED_VERDE       0
-#define PIN_LED_AMARILLO    1
-#define PIN_LED_ROJO        3
-
 static const char *TAG = "sismo";
 
 typedef enum {
@@ -103,35 +97,6 @@ static void IRAM_ATTR isr_sensor(void *arg)
     portYIELD_FROM_ISR(hay_tarea_mas_prioritaria);
 }
 
-//HACER LEDS
-static void indicar_nivel(nivel_t n)
-{
-#if USAR_LEDS
-    gpio_set_level(PIN_LED_VERDE, n == NIVEL_BAJO);
-    gpio_set_level(PIN_LED_AMARILLO, n == NIVEL_MEDIO);
-    gpio_set_level(PIN_LED_ROJO, n == NIVEL_ALTO);
-#else
-    (void)n;
-#endif
-}
-
-static void init_leds(void)
-{
-#if USAR_LEDS
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << PIN_LED_VERDE) |
-                        (1ULL << PIN_LED_AMARILLO) |
-                        (1ULL << PIN_LED_ROJO),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&cfg);
-    indicar_nivel(NIVEL_NINGUNO);
-#endif
-}
-
 //Informe de golpe
 static void registrar_golpe(int64_t ahora, uint32_t intensidad_mg)
 {
@@ -166,7 +131,6 @@ static void registrar_golpe(int64_t ahora, uint32_t intensidad_mg)
         if (nivel > s_nivel_maximo) {
             s_nivel_maximo = nivel;
         }
-        indicar_nivel(nivel);
         printf("  NIVEL %s  (%d golpes en los ultimos %d s)\n",
                NOMBRE_NIVEL[nivel], n, VENTANA_MS / 1000);
     } else {
@@ -175,8 +139,6 @@ static void registrar_golpe(int64_t ahora, uint32_t intensidad_mg)
         printf("  [%" PRIu32 " mg]", intensidad_mg);
         printf("\n");
     }
-
-    (void)intensidad_mg;
 }
 
 //Pasan 10 segundos sin noticias para terminar
@@ -206,7 +168,6 @@ static void verificar_cierre(int64_t ahora)
     s_nivel_maximo = NIVEL_NINGUNO;
     s_t_ultimo_contado = 0;
     ventana_reset();
-    indicar_nivel(NIVEL_NINGUNO);
 
     printf("VIGILANDO MOVIMIENTOS\n");
 }
@@ -269,8 +230,6 @@ static void tarea_sismo(void *arg)
 void app_main(void)
 {
     printf(" SISTEMA DE DETECCION DE TERREMOTO\n");
-
-    init_leds();
 
     if (mpu_init() != ESP_OK) {
         ESP_LOGE(TAG, "No se pudo inicializar el sensor.");
