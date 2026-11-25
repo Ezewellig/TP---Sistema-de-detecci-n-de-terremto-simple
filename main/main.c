@@ -9,221 +9,208 @@
 #include "nivel_terremoto.h"
 #include "mpu6500.h"
 
-#define PIN_SENSOR 4
+#define PIN_AVISO 4
 
-//ventana
-#define VENTANA_MS 10000
-#define VENTANA_US (VENTANA_MS * 1000LL)
-#define MAX_GOLPES 64
-#define REFRACTARIO_MS 120 //Si despues de un golpe se sigue detectando movimiento, subir este valor
-#define UMBRAL_GOLPE_MG 40 //aceleracion minima para contar
-#define MUESTRAS_CALIB 200
-#define K_BASE 6
+#define TIEMPO_VENTANA_MS 10000
+#define TIEMPO_VENTANA_US (TIEMPO_VENTANA_MS * 1000LL)
+#define MAXIMO_GOLPES 64
+#define ESPERA_ENTRE_GOLPES_MS 120
+#define MINIMO_GOLPE_MG 40
+#define LECTURAS_INICIALES 200
+#define SUAVIZADO 6
 
-//clasificacion por CANTIDAD de golpes en la ventana
-#define N_PARA_MEDIO 10 //  10 a 24 golpes -> MEDIO
-#define N_PARA_ALTO 25 // >=25 golpes -> ALTO
-// 1 a 9 golpes  -> BAJO
+#define GOLPES_MEDIO 10
+#define GOLPES_ALTO 25
 
-static const char *TAG = "sismo";
+static const char *ETIQUETA = "sismo";
 
 typedef enum {
-    NIVEL_NINGUNO = 0,
+    NIVEL_NADA = 0,
     NIVEL_BAJO,
     NIVEL_MEDIO,
     NIVEL_ALTO
-} nivel_t;
+} nivel_sismo_t;
 
-static const char *NOMBRE_NIVEL[] = { "-", "BAJO", "MEDIO", "ALTO" };
+static const char *TEXTO_NIVEL[] = { "-", "BAJO", "MEDIO", "ALTO" };
 
-static TaskHandle_t s_tarea;
+static TaskHandle_t tarea_principal;
 
-//cola FIFO circular de marcas de tiempo
-static int64_t s_cola[MAX_GOLPES];
-static int s_ini  = 0;
-static int s_cant = 0;
+static int64_t lista_tiempos[MAXIMO_GOLPES];
+static int primero  = 0;
+static int cantidad = 0;
 
-//terremoto en curso
-static bool s_evento_activo  = false;
-static int64_t s_t_primer_golpe = 0;
-static int64_t s_t_ultimo_golpe = 0;
-static uint32_t s_golpes_totales = 0;
-static nivel_t s_nivel_actual = NIVEL_NINGUNO;
-static nivel_t s_nivel_maximo = NIVEL_NINGUNO;
-static int64_t s_t_ultimo_contado = 0;
-static uint32_t s_pico_lsb = 0;
+static bool hay_terremoto = false;
+static int64_t hora_inicio = 0;
+static int64_t hora_ultimo_golpe = 0;
+static uint32_t total_golpes = 0;
+static nivel_sismo_t nivel_actual = NIVEL_NADA;
+static nivel_sismo_t nivel_maximo = NIVEL_NADA;
+static int64_t hora_ultimo_contado = 0;
+static uint32_t golpe_mas_fuerte = 0;
 
-//Ventana deslizante
-static void ventana_reset(void)
+static void vaciar_lista(void)
 {
-    s_ini = 0;
-    s_cant = 0;
+    primero = 0;
+    cantidad = 0;
 }
 
-static void ventana_agregar(int64_t t)
+static void agregar_golpe(int64_t hora)
 {
-    if (s_cant == MAX_GOLPES) {
-        s_ini = (s_ini + 1) % MAX_GOLPES;
-        s_cant--;
+    if (cantidad == MAXIMO_GOLPES) {
+        primero = (primero + 1) % MAXIMO_GOLPES;
+        cantidad--;
     }
-    s_cola[(s_ini + s_cant) % MAX_GOLPES] = t;
-    s_cant++;
+    lista_tiempos[(primero + cantidad) % MAXIMO_GOLPES] = hora;
+    cantidad++;
 }
 
-//Descarta lo que quedo fuera de la ventana y devuelve cuantos quedan
-static int ventana_contar(int64_t ahora)
+static int contar_golpes_recientes(int64_t ahora)
 {
-    while (s_cant > 0 && (ahora - s_cola[s_ini]) > VENTANA_US) {
-        s_ini = (s_ini + 1) % MAX_GOLPES;
-        s_cant--;
+    while (cantidad > 0 && (ahora - lista_tiempos[primero]) > TIEMPO_VENTANA_US) {
+        primero = (primero + 1) % MAXIMO_GOLPES;
+        cantidad--;
     }
-    return s_cant;
+    return cantidad;
 }
 
-//Clasificacion
-static nivel_t clasificar(int golpes_en_ventana)
+static nivel_sismo_t elegir_nivel(int golpes)
 {
-    if (golpes_en_ventana >= N_PARA_ALTO) return NIVEL_ALTO;
-    if (golpes_en_ventana >= N_PARA_MEDIO) return NIVEL_MEDIO;
-    if (golpes_en_ventana >= 1) return NIVEL_BAJO;
-    return NIVEL_NINGUNO;
+    if (golpes >= GOLPES_ALTO) return NIVEL_ALTO;
+    if (golpes >= GOLPES_MEDIO) return NIVEL_MEDIO;
+    if (golpes >= 1) return NIVEL_BAJO;
+    return NIVEL_NADA;
 }
 
-//int
-static void IRAM_ATTR isr_sensor(void *arg)
+static void IRAM_ATTR aviso_del_sensor(void *arg)
 {
-    BaseType_t hay_tarea_mas_prioritaria = pdFALSE;
-    vTaskNotifyGiveFromISR(s_tarea, &hay_tarea_mas_prioritaria);
-    portYIELD_FROM_ISR(hay_tarea_mas_prioritaria);
+    BaseType_t cambiar_tarea = pdFALSE;
+    vTaskNotifyGiveFromISR(tarea_principal, &cambiar_tarea);
+    portYIELD_FROM_ISR(cambiar_tarea);
 }
 
-//Informe de golpe
-static void registrar_golpe(int64_t ahora, uint32_t intensidad_mg)
+static void anotar_golpe(int64_t ahora, uint32_t fuerza_mg)
 {
-    if (s_t_ultimo_contado != 0 &&
-        (ahora - s_t_ultimo_contado) < (REFRACTARIO_MS * 1000LL)) {
+    if (hora_ultimo_contado != 0 &&
+        (ahora - hora_ultimo_contado) < (ESPERA_ENTRE_GOLPES_MS * 1000LL)) {
         return;
     }
-    s_t_ultimo_contado = ahora;
+    hora_ultimo_contado = ahora;
 
-    if (!s_evento_activo) {
-        s_evento_activo  = true;
-        s_t_primer_golpe = ahora;
-        s_golpes_totales = 0;
-        s_nivel_actual   = NIVEL_NINGUNO;
-        s_nivel_maximo   = NIVEL_NINGUNO;
-        s_pico_lsb = 0;
-        ventana_reset();
+    if (!hay_terremoto) {
+        hay_terremoto = true;
+        hora_inicio = ahora;
+        total_golpes = 0;
+        nivel_actual = NIVEL_NADA;
+        nivel_maximo = NIVEL_NADA;
+        golpe_mas_fuerte = 0;
+        vaciar_lista();
         printf("\nInicio del terremoto\n");
     }
 
-    s_golpes_totales++;
-    s_t_ultimo_golpe = ahora;
+    total_golpes++;
+    hora_ultimo_golpe = ahora;
 
-    ventana_agregar(ahora);
-    int n = ventana_contar(ahora);
+    agregar_golpe(ahora);
+    int recientes = contar_golpes_recientes(ahora);
 
-    nivel_t nivel = clasificar(n);
+    nivel_sismo_t nivel = elegir_nivel(recientes);
 
-    //Subió de nivel
-    if (nivel > s_nivel_actual) {
-        s_nivel_actual = nivel;
-        if (nivel > s_nivel_maximo) {
-            s_nivel_maximo = nivel;
+    if (nivel > nivel_actual) {
+        nivel_actual = nivel;
+        if (nivel > nivel_maximo) {
+            nivel_maximo = nivel;
         }
         printf("  NIVEL %s  (%d golpes en los ultimos %d s)\n",
-               NOMBRE_NIVEL[nivel], n, VENTANA_MS / 1000);
+               TEXTO_NIVEL[nivel], recientes, TIEMPO_VENTANA_MS / 1000);
     } else {
         printf("golpe #%" PRIu32 "  (%d en ventana)",
-               s_golpes_totales, n);
-        printf("  [%" PRIu32 " mg]", intensidad_mg);
+               total_golpes, recientes);
+        printf("  [%" PRIu32 " mg]", fuerza_mg);
         printf("\n");
     }
 }
 
-//Pasan 10 segundos sin noticias para terminar
-static void verificar_cierre(int64_t ahora)
+static void revisar_si_termino(int64_t ahora)
 {
-    if (!s_evento_activo) {
+    if (!hay_terremoto) {
         return;
     }
-    if ((ahora - s_t_ultimo_golpe) <= VENTANA_US) {
+    if ((ahora - hora_ultimo_golpe) <= TIEMPO_VENTANA_US) {
         return;
     }
 
-    int64_t duracion_ms = (s_t_ultimo_golpe - s_t_primer_golpe) / 1000;
+    int64_t duracion_ms = (hora_ultimo_golpe - hora_inicio) / 1000;
 
     printf("FIN DEL TERREMOTO\n");
     printf("Duracion total: %" PRId64 " ms  (%.1f s)\n",
            duracion_ms, duracion_ms / 1000.0);
-    printf("Golpes totales: %" PRIu32 "\n", s_golpes_totales);
-    printf("Nivel maximo: %s\n", NOMBRE_NIVEL[s_nivel_maximo]);
+    printf("Golpes totales: %" PRIu32 "\n", total_golpes);
+    printf("Nivel maximo: %s\n", TEXTO_NIVEL[nivel_maximo]);
     printf("Pico medido: %" PRIu32 " mg\n",
-           (s_pico_lsb * 125u) >> 11);
+           (golpe_mas_fuerte * 125u) >> 11);
 
-    //Volver a vigilar
-    s_evento_activo = false;
-    s_golpes_totales = 0;
-    s_nivel_actual = NIVEL_NINGUNO;
-    s_nivel_maximo = NIVEL_NINGUNO;
-    s_t_ultimo_contado = 0;
-    ventana_reset();
+    hay_terremoto = false;
+    total_golpes = 0;
+    nivel_actual = NIVEL_NADA;
+    nivel_maximo = NIVEL_NADA;
+    hora_ultimo_contado = 0;
+    vaciar_lista();
 
     printf("VIGILANDO MOVIMIENTOS\n");
+    printf("Contador de eventos: %lu\n", (unsigned long)total_golpes);
 }
 
-static void tarea_sismo(void *arg)
+static void vigilar_sismo(void *arg)
 {
-    accel_raw_t m;
-    int32_t base_x = 0, base_y = 0, base_z = 0;
-    bool primera = true;
-    uint32_t calib  = 0;
-    ESP_LOGI(TAG, "Calibrando...");
+    lectura_t lectura;
+    int32_t promedio_x = 0, promedio_y = 0, promedio_z = 0;
+    bool es_la_primera = true;
+    uint32_t contador_inicio = 0;
+    ESP_LOGI(ETIQUETA, "Calibrando...");
 
     for (;;) {
         uint32_t avisos = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
         int64_t  ahora  = esp_timer_get_time();
 
         if (avisos > 0) {
-            //leemos y calculamos si supera el umbral
-            if (mpu_read_accel(&m) == ESP_OK) {
+            if (leer_aceleracion(&lectura) == ESP_OK) {
 
-                if (primera) {
-                    base_x = (int32_t)m.ax << K_BASE;
-                    base_y = (int32_t)m.ay << K_BASE;
-                    base_z = (int32_t)m.az << K_BASE;
-                    primera = false;
+                if (es_la_primera) {
+                    promedio_x = (int32_t)lectura.x << SUAVIZADO;
+                    promedio_y = (int32_t)lectura.y << SUAVIZADO;
+                    promedio_z = (int32_t)lectura.z << SUAVIZADO;
+                    es_la_primera = false;
                 }
 
-                // filtro pasaaltos: le sacamos la gravedad
-                base_x += (((int32_t)m.ax << K_BASE) - base_x) >> K_BASE;
-                base_y += (((int32_t)m.ay << K_BASE) - base_y) >> K_BASE;
-                base_z += (((int32_t)m.az << K_BASE) - base_z) >> K_BASE;
+                promedio_x += (((int32_t)lectura.x << SUAVIZADO) - promedio_x) >> SUAVIZADO;
+                promedio_y += (((int32_t)lectura.y << SUAVIZADO) - promedio_y) >> SUAVIZADO;
+                promedio_z += (((int32_t)lectura.z << SUAVIZADO) - promedio_z) >> SUAVIZADO;
 
-                int32_t hx = (int32_t)m.ax - (base_x >> K_BASE);
-                int32_t hy = (int32_t)m.ay - (base_y >> K_BASE);
-                int32_t hz = (int32_t)m.az - (base_z >> K_BASE);
+                int32_t mov_x = (int32_t)lectura.x - (promedio_x >> SUAVIZADO);
+                int32_t mov_y = (int32_t)lectura.y - (promedio_y >> SUAVIZADO);
+                int32_t mov_z = (int32_t)lectura.z - (promedio_z >> SUAVIZADO);
 
-                uint32_t mag2 = asm_mag2(hx, hy, hz);
-                uint32_t mag  = asm_isqrt(mag2);
-                uint32_t mg   = (mag * 125u) >> 11;
+                uint32_t suma      = sumar_cuadrados(mov_x, mov_y, mov_z);
+                uint32_t fuerza    = raiz_cuadrada(suma);
+                uint32_t fuerza_mg = (fuerza * 125u) >> 11;
 
-                if (calib < MUESTRAS_CALIB) {
-                    calib++;
-                    if (calib == MUESTRAS_CALIB) {
+                if (contador_inicio < LECTURAS_INICIALES) {
+                    contador_inicio++;
+                    if (contador_inicio == LECTURAS_INICIALES) {
                         printf("\nVIGILANDO MOVIMIENTOS\n");
+                        printf("\nContador de eventos: %lu\n", (unsigned long)total_golpes);
                         printf("Umbral de golpe: %d mg | ventana: %d s | "
                                "medio >= %d golpes | alto >= %d golpes\n\n",
-                               UMBRAL_GOLPE_MG, VENTANA_MS / 1000,
-                               N_PARA_MEDIO, N_PARA_ALTO);
+                               MINIMO_GOLPE_MG, TIEMPO_VENTANA_MS / 1000,
+                               GOLPES_MEDIO, GOLPES_ALTO);
                     }
-                } else if (mg >= UMBRAL_GOLPE_MG) {
-                    s_pico_lsb = asm_max_u32(s_pico_lsb, mag);  /* ASSEMBLER */
-                    registrar_golpe(ahora, mg);
+                } else if (fuerza_mg >= MINIMO_GOLPE_MG) {
+                    golpe_mas_fuerte = elegir_mayor(golpe_mas_fuerte, fuerza);
+                    anotar_golpe(ahora, fuerza_mg);
                 }
             }
         }
-        verificar_cierre(ahora);
+        revisar_si_termino(ahora);
     }
 }
 
@@ -231,27 +218,25 @@ void app_main(void)
 {
     printf(" SISTEMA DE DETECCION DE TERREMOTO\n");
 
-    if (mpu_init() != ESP_OK) {
-        ESP_LOGE(TAG, "No se pudo inicializar el sensor.");
+    if (iniciar_mpu() != ESP_OK) {
+        ESP_LOGE(ETIQUETA, "No se pudo inicializar el sensor.");
         return;
     }
 
-    xTaskCreate(tarea_sismo, "sismo", 4096, NULL, 10, &s_tarea);
+    xTaskCreate(vigilar_sismo, "sismo", 4096, NULL, 10, &tarea_principal);
 
-    gpio_config_t cfg_int = {
-        .pin_bit_mask = (1ULL << PIN_SENSOR),
+    gpio_config_t config_pin = {
+        .pin_bit_mask = (1ULL << PIN_AVISO),
         .mode = GPIO_MODE_INPUT,
-
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_POSEDGE,
     };
-    ESP_ERROR_CHECK(gpio_config(&cfg_int));
+    ESP_ERROR_CHECK(gpio_config(&config_pin));
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
-    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_SENSOR, isr_sensor, NULL));
-    ESP_ERROR_CHECK(mpu_habilitar_int_dato_listo(true));
-    printf("\nVIGILANDO MOVIMIENTOS\n");
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_AVISO, aviso_del_sensor, NULL));
+    ESP_ERROR_CHECK(activar_aviso_mpu(true));
     printf("Ventana: %d s | medio >= %d golpes | alto >= %d golpes\n\n",
-           VENTANA_MS / 1000, N_PARA_MEDIO, N_PARA_ALTO);
-    ESP_LOGI(TAG, "Interrupciones activas en GPIO%d", PIN_SENSOR);
+           TIEMPO_VENTANA_MS / 1000, GOLPES_MEDIO, GOLPES_ALTO);
+    ESP_LOGI(ETIQUETA, "Interrupciones activas en GPIO%d", PIN_AVISO);
 }
