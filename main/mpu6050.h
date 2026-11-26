@@ -10,19 +10,17 @@
 #define VELOCIDAD_BUS 400000
 #define DIRECCION_MPU 0x68
 
-#define REG_VELOCIDAD_LECTURAS  0x19
-#define REG_FILTRO              0x1A
-#define REG_GIROSCOPIO          0x1B
-#define REG_RANGO_ACELERACION   0x1C
-#define REG_FILTRO_ACELERACION  0x1D
-#define REG_CONFIG_PIN_AVISO    0x37
-#define REG_ACTIVAR_AVISO       0x38
-#define REG_ESTADO_AVISO        0x3A
-#define REG_PRIMER_DATO         0x3B
-#define REG_ENCENDIDO           0x6B
-#define REG_QUIEN_SOS           0x75
+#define REG_VELOCIDAD_LECTURAS 0x19
+#define REG_FILTRO 0x1A
+#define REG_RANGO_ACELERACION 0x1C
+#define REG_FILTRO_ACELERACION 0x1D
+#define REG_CONFIG_PIN_AVISO 0x37
+#define REG_ACTIVAR_AVISO 0x38
+#define REG_ESTADO_AVISO 0x3A
+#define REG_PRIMER_DATO 0x3B
+#define REG_ENCENDIDO 0x6B
 
-typedef struct {
+typedef struct{
     int16_t x;
     int16_t y;
     int16_t z;

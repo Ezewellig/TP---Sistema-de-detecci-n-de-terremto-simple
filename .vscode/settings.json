@@ -1,0 +1,12 @@
+{
+    "idf.currentSetup": "C:\\esp\\v5.5.4\\esp-idf",
+    "idf.openOcdConfigs": [
+        "board/esp32c3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "OPENOCD_USB_ADAPTER_LOCATION": "1-14",
+        "IDF_TARGET": "esp32c3"
+    },
+    "idf.flashType": "UART",
+    "idf.port": "COM3"
+}
